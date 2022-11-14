@@ -21,6 +21,7 @@ Options:
     --debug               Print debug information
     --ignore <dirs>...    Ignore extra directories, each separated by a comma
     --no-follow-links     Do not follow symbolic links in the project
+    --root <file>         Project root
     --encoding <charset>  Use encoding parameter for file open
     --savepath <file>     Save the list of requirements in the given file
     --print               Output the list of requirements in the standard
@@ -36,19 +37,30 @@ Options:
                           <gt>     | e.g. Flask>=1.1.2
                           <no-pin> | e.g. Flask
 """
-from contextlib import contextmanager
-import os
-import sys
-import re
-import logging
 import ast
+import logging
+import os
+import re
+import sys
 import traceback
-from docopt import docopt
+from contextlib import contextmanager
+from importlib.util import find_spec
+from pathlib import Path
+from typing import List, Set, Optional, Tuple
+
 import requests
+from docopt import docopt
 from yarg import json2package
 from yarg.exceptions import HTTPError
 
 from pipreqs import __version__
+
+REGEXP_V2 = [
+    re.compile(r'(?:\n|;|^)\s*?import\s*\((.+?)\)', flags=re.DOTALL),
+    re.compile(r'(?:\n|;|^)\s*?import\s+(.+?)(?=$|\n)', flags=re.DOTALL),
+    re.compile(r'(?:\n|;|^)\s*?from\s+([a-zA-Z0-9\._]+)\s+import\s*?\((.+?)\)', flags=re.DOTALL),
+    re.compile(r'(?:\n|;|^)\s*?from\s+([a-zA-Z0-9\._]+)\s+import\s*?([^\(\)]+?)(?=$|\n)', flags=re.DOTALL)
+]
 
 REGEXP = [
     re.compile(r'^import (.+)$'),
@@ -147,6 +159,194 @@ def get_all_imports(
         data = {x.strip() for x in f}
 
     return list(packages - data)
+
+
+def get_all_imports_v2(
+    path,
+    encoding=None,
+    extra_ignore_dirs=None,
+    root=None
+):
+    path = Path(path)
+    if path.is_absolute() and root is None:
+        raise ValueError("Specify relative path either specify root path.")
+    if root is not None:
+        root = Path(root)
+    else:
+        root = Path("./")
+    sys.path.append(str(root.absolute()).replace('\\', r"\\"))
+    path = path.relative_to(root)
+
+    raw_packages = set()
+    ignore_dirs = {".hg", ".svn", ".git", ".tox", "__pycache__", "env", "venv"}
+
+    update_ignore_dirs_with_extra_dirs(
+        ignore_dirs,
+        extra_ignore_dirs
+    )
+    to_be_processed_files = {root / path}
+    visited_paths = set()
+    while to_be_processed_files:
+        path = to_be_processed_files.pop()
+        if not path.exists():
+            logging.warning(f"Path '{path.absolute()}' doesn't exist. Continue.")
+            continue
+        logging.info(f"PATH: {path.absolute()}")
+        if path in visited_paths:
+            continue
+        visited_paths.add(path)
+
+        if path.is_file():
+            if not is_python_file(path.name):
+                raise NotImplementedError(f"Got non python file without .py extension: {path}")
+            local_files, local_packages, site_packages = split_into_local_and_site_packages(
+                get_imports_given_filepath(path, encoding)
+            )
+            local_files = set(map(lambda x: root / (x.replace('.', '\\') + ".py"), local_files))
+            local_packages = set(map(lambda x: root / x.replace('.', '\\'), local_packages))
+            raw_packages.update(site_packages)
+            to_be_processed_files.update(local_packages)
+            to_be_processed_files.update(local_files)
+        else:
+            for file in path.glob("*"):
+                if file.is_dir() and file.name not in ignore_dirs:
+                    to_be_processed_files.add(root / file.relative_to(root))
+                elif is_python_file(file.name):
+                    to_be_processed_files.add(root / file.relative_to(root))
+
+    # Clean up imports
+    imports = clean_package_names(raw_packages)
+    imports = remove_stdlib(imports)
+    return imports
+
+
+def split_into_local_and_site_packages(packages: Set[Tuple[str]]) -> Tuple[Set[str], Set[str], Set[str]]:
+    local_packages = set()
+    local_files = set()
+    site_packages = set()
+    for package in packages:
+        package_type, package_name = get_package_type_and_name(package)
+        package_name = set(package_name)
+        try:
+            if package_type == "LOCAL FILE":
+                local_files.update(package_name)
+            elif package_type == "LOCAL PACKAGE":
+                local_packages.update(package_name)
+            elif package_type == "SITE":
+                site_packages.update(package_name)
+            else:
+                raise TypeError(f"Got unexpected package name '{package}' with package_type {package_type}")
+        except TypeError as error_msg:
+            print(error_msg)
+            continue
+    return local_files, local_packages, site_packages
+
+
+def get_package_type_and_name(name: Tuple[str]) -> Tuple[Optional[str], Tuple[str]]:
+    package_type = None
+    try:
+        res = find_spec(name[0])
+    except ModuleNotFoundError as error:
+        print(error, name)
+        return package_type, (name[0],)
+    if res is not None:
+        if "site-packages" in res.origin:
+            package_type = "SITE"
+            return package_type, tuple(f"{name[0]}.{_}" for _ in name[1:]) if len(name) >= 2 else (name[0],)
+        elif getattr(res, "submodule_search_locations"):
+            if len(name) >= 2:
+                package_type = "LOCAL FILE"
+                return package_type, tuple(f"{name[0]}.{_}" for _ in name[1:])
+            else:
+                package_type = "LOCAL PACKAGE"
+                return package_type, name
+        else:
+            package_type = "LOCAL FILE"
+            return package_type, (name[0],)
+    return package_type, name
+
+
+def is_python_file(file_name: str):
+    return os.path.splitext(file_name)[-1] == ".py"
+
+
+def update_ignore_dirs_with_extra_dirs(
+    ignore_dirs: Set[str],
+    extra_ignore_dirs: Optional[List[str]]
+):
+    if not extra_ignore_dirs:
+        return
+    ignore_dirs_parsed = set()
+    for extra_dir in extra_ignore_dirs:
+        ignore_dirs_parsed.add(
+            os.path.basename(
+                os.path.realpath(extra_dir)
+            )
+        )
+    ignore_dirs.update(ignore_dirs_parsed)
+
+
+def get_imports_given_filepath(
+    filepath: str,
+    encoding=None
+) -> Set[Tuple[str]]:
+    with open(filepath, "r", encoding=encoding) as f:
+        contents = f.read()
+
+    candidates = []
+    for pattern in REGEXP_V2:
+        candidates += list(re.finditer(pattern, contents))
+
+    candidates = sorted(
+        candidates,
+        key=lambda match: (match.span()[0], -match.span()[1]),
+        reverse=True
+    )
+
+    i = len(candidates) - 1
+    while i > 0:
+        i -= 1
+        if candidates[i].span()[1] > candidates[i + 1].span()[1]:
+            continue
+        candidates.pop(i)
+
+    raw_packages = set()
+    for match in candidates:
+        groups = match.groups()
+        if len(groups) == 1:
+            raw_packages.add(
+                (groups[0].strip().split(" ")[0],)
+            )
+        else:
+            raw_packages.add(
+                (
+                    groups[0],
+                    *list(
+                        map(
+                            lambda x: x.strip().split(" ")[0],
+                            groups[1].split(',')
+                        )
+                    )
+                )
+            )
+    return raw_packages
+
+
+def clean_package_names(raw_packages: Set[str]) -> Set[str]:
+    packages = set()
+    for name in filter(bool, raw_packages):
+        cleaned_name = name.partition('.')[0]
+        packages.add(cleaned_name)
+    return packages
+
+
+def remove_stdlib(packages: Set[str]) -> List[str]:
+    logging.debug('Found packages: {0}'.format(packages))
+
+    with open(join("stdlib"), "r") as file:
+        std_libs = {package.strip() for package in file}
+
+    return list(packages - std_libs)
 
 
 def filter_line(line):
@@ -405,6 +605,7 @@ def init(args):
     encoding = args.get('--encoding')
     extra_ignore_dirs = args.get('--ignore')
     follow_links = not args.get('--no-follow-links')
+    root_path = args.get('--root')
     input_path = args['<path>']
     if input_path is None:
         input_path = os.path.abspath(os.curdir)
@@ -412,10 +613,20 @@ def init(args):
     if extra_ignore_dirs:
         extra_ignore_dirs = extra_ignore_dirs.split(',')
 
-    candidates = get_all_imports(input_path,
-                                 encoding=encoding,
-                                 extra_ignore_dirs=extra_ignore_dirs,
-                                 follow_links=follow_links)
+    if root_path is not None:
+        candidates = get_all_imports_v2(
+            input_path,
+            encoding=encoding,
+            extra_ignore_dirs=extra_ignore_dirs,
+            root=root_path
+        )
+    else:
+        candidates = get_all_imports(
+            input_path,
+            encoding=encoding,
+            extra_ignore_dirs=extra_ignore_dirs,
+            follow_links=follow_links
+        )
     candidates = get_pkg_names(candidates)
     logging.debug("Found imports: " + ", ".join(candidates))
     pypi_server = "https://pypi.python.org/pypi/"
